@@ -51,10 +51,26 @@ _REPLACEMENT_EXPRESSION = re.compile(r"^\|([^|\n]*)\|([^|\n]*)\|$")
 def _usage_text() -> str:
     """Return the short usage summary printed to stderr on bad CLI usage."""
     return (
-        f"usage: {PROG} --upstream-repo REPO --repo REPO --ref REF --paths JSON \\\n"
+        f"usage: {PROG} --upstream-repo REPO --repo REPO --ref REF "
+        f"(--paths JSON | --paths-file FILE) \\\n"
         f"  --component-group GROUP --internal-request-pipeline-run-name NAME \\\n"
         f"  --internal-request-task-run-name NAME [--temp-dir DIR]\n"
     )
+
+
+def _resolve_paths_argument(ns: argparse.Namespace) -> None:
+    """Populate ``ns.paths`` from ``--paths`` or ``--paths-file`` (exactly one required)."""
+    inline = (ns.paths or "").strip()
+    file_arg = (ns.paths_file or "").strip()
+    if bool(inline) == bool(file_arg):
+        print(_usage_text(), file=sys.stderr, end="")
+        raise SystemExit(1)
+    if file_arg:
+        try:
+            ns.paths = Path(file_arg).read_text(encoding="utf-8").strip()
+        except OSError:
+            print(_usage_text(), file=sys.stderr, end="")
+            raise SystemExit(1) from None
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -65,6 +81,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--repo", metavar="REPO")
     p.add_argument("--ref", metavar="REF")
     p.add_argument("--paths", metavar="JSON")
+    p.add_argument("--paths-file", metavar="FILE")
     p.add_argument("--component-group", metavar="GROUP")
     p.add_argument("--internal-request-pipeline-run-name", metavar="NAME")
     p.add_argument("--internal-request-task-run-name", metavar="NAME")
@@ -77,12 +94,15 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "upstream_repo",
         "repo",
         "ref",
-        "paths",
         "component_group",
         "internal_request_pipeline_run_name",
         "internal_request_task_run_name",
     )
     if any(not getattr(ns, f) or not str(getattr(ns, f)).strip() for f in required):
+        print(_usage_text(), file=sys.stderr, end="")
+        raise SystemExit(1)
+    _resolve_paths_argument(ns)
+    if not ns.paths:
         print(_usage_text(), file=sys.stderr, end="")
         raise SystemExit(1)
     return ns

@@ -328,6 +328,92 @@ def test_parse_args_ok() -> None:
     assert ns.component_group == "my-group"
 
 
+def test_parse_args_paths_file_ok(tmp_path: Path) -> None:
+    """``--paths-file`` loads JSON from disk instead of argv."""
+    paths_file = tmp_path / "paths.json"
+    paths_file.write_text('[{"path":"f.yaml","replacements":[]}]', encoding="utf-8")
+    ns = process_file_updates.parse_args(
+        [
+            "--upstream-repo",
+            "https://gitlab.com/org/upstream.git",
+            "--repo",
+            "https://gitlab.com/org/repo.git",
+            "--ref",
+            "main",
+            "--paths-file",
+            str(paths_file),
+            "--component-group",
+            "my-group",
+            "--internal-request-pipeline-run-name",
+            "pr-1",
+            "--internal-request-task-run-name",
+            "tr-1",
+        ]
+    )
+    assert ns.paths == '[{"path":"f.yaml","replacements":[]}]'
+
+
+def test_parse_args_rejects_both_paths_and_paths_file(tmp_path: Path) -> None:
+    """``--paths`` and ``--paths-file`` are mutually exclusive."""
+    paths_file = tmp_path / "paths.json"
+    paths_file.write_text("[]", encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        process_file_updates.parse_args(
+            [
+                *_VALID_ARGS,
+                "--paths-file",
+                str(paths_file),
+            ]
+        )
+    assert exc.value.code == 1
+
+
+def test_parse_args_rejects_missing_paths_source() -> None:
+    """Either ``--paths`` or ``--paths-file`` must be provided."""
+    with pytest.raises(SystemExit) as exc:
+        process_file_updates.parse_args(
+            [
+                "--upstream-repo",
+                "https://gitlab.com/org/upstream.git",
+                "--repo",
+                "https://gitlab.com/org/repo.git",
+                "--ref",
+                "main",
+                "--component-group",
+                "my-group",
+                "--internal-request-pipeline-run-name",
+                "pr-1",
+                "--internal-request-task-run-name",
+                "tr-1",
+            ]
+        )
+    assert exc.value.code == 1
+
+
+def test_parse_args_rejects_missing_paths_file(tmp_path: Path) -> None:
+    """A missing ``--paths-file`` path is rejected."""
+    with pytest.raises(SystemExit) as exc:
+        process_file_updates.parse_args(
+            [
+                "--upstream-repo",
+                "https://gitlab.com/org/upstream.git",
+                "--repo",
+                "https://gitlab.com/org/repo.git",
+                "--ref",
+                "main",
+                "--paths-file",
+                str(tmp_path / "missing.json"),
+                "--component-group",
+                "my-group",
+                "--internal-request-pipeline-run-name",
+                "pr-1",
+                "--internal-request-task-run-name",
+                "tr-1",
+            ]
+        )
+    assert exc.value.code == 1
+
+
 def test_parse_replacement_expression() -> None:
     """Replacement strings must match ``|search|replace|`` exactly."""
     assert process_file_updates.parse_replacement_expression("|a|b|") == ("a", "b")
