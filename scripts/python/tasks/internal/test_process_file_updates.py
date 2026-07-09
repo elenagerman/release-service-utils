@@ -19,12 +19,19 @@ Former Tekton scenarios are covered by pytest:
   ``test_apply_replacement_block_too_greedy``
 - ``seed-error``: ``test_seed_target_file_propagates_git_add_failure``,
   ``test_main_subprocess_error_writes_failed``
+- YAML tooling integration (real ``yq``/``awk``/``sed``):
+  ``test_blank_lines_before_yaml_cases``,
+  ``test_apply_replacements_integration_*``,
+  ``test_process_all_paths_integration_multiple_files``,
+  ``test_process_all_paths_integration_seed_then_replacement``,
+  ``test_apply_replacement_block_integration_*``
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from unittest import mock
@@ -123,6 +130,174 @@ def secret_mount(tmp_path: Path) -> Path:
     p = tmp_path / "secrets"
     _write_file_updates_secret(p)
     return p
+
+
+def _require_yq() -> None:
+    """Skip integration tests when ``yq`` is not on ``PATH`` (CI installs v4.34.1)."""
+    if shutil.which("yq") is None:
+        pytest.skip("yq is not installed")
+
+
+def _require_gnu_sed() -> None:
+    """Skip integration tests that rely on GNU ``sed -i`` range syntax."""
+    if shutil.which("sed") is None:
+        pytest.skip("sed is not installed")
+    proc = subprocess.run(["sed", "--version"], text=True, capture_output=True, check=False)
+    if proc.returncode != 0 or "GNU sed" not in (proc.stdout + proc.stderr):
+        pytest.skip("GNU sed is required for replacement integration tests")
+
+
+def _require_yaml_tooling() -> None:
+    """Skip tests that exercise the full ``yq``/``awk``/``sed`` replacement path."""
+    _require_yq()
+    _require_gnu_sed()
+
+
+_COMPLEX_DEPLOY_YAML = """\
+# Managed tenant deploy manifest (representative fixture)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-app
+  labels:
+    app.kubernetes.io/name: demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: demo
+  template:
+    metadata:
+      labels:
+        app: demo
+    spec:
+      serviceAccountName: demo
+      containers:
+        - name: primary
+          indexImage:
+
+
+          releaseImage:
+
+
+        - name: sidecar
+          indexImage:
+
+
+"""
+
+
+def _large_deploy_yaml() -> str:
+    """Return a 100+ line deploy manifest with nested keys at varied line offsets."""
+    lines = [
+        "# Managed-tenant deploy manifest (large integration fixture)",
+        "# Exercises comment/``---`` offsets and deep nested ``yq`` paths",
+        "---",
+        "apiVersion: apps/v1",
+        "kind: Deployment",
+        "metadata:",
+        "  name: demo-app",
+        "  namespace: managed-tenant",
+        "  labels:",
+        "    app.kubernetes.io/name: demo",
+        "    app.kubernetes.io/part-of: release-service",
+        "  annotations:",
+        "    release.appstudio.openshift.io/component: demo",
+        "spec:",
+        "  replicas: 3",
+        "  revisionHistoryLimit: 5",
+        "  selector:",
+        "    matchLabels:",
+        "      app: demo",
+        "  strategy:",
+        "    type: RollingUpdate",
+        "    rollingUpdate:",
+        "      maxSurge: 1",
+        "      maxUnavailable: 0",
+        "  template:",
+        "    metadata:",
+        "      labels:",
+        "        app: demo",
+        "      annotations:",
+        "        checksum/config: placeholder",
+        "    spec:",
+        "      serviceAccountName: demo",
+        "      securityContext:",
+        "        runAsNonRoot: true",
+        "      affinity:",
+        "        nodeAffinity:",
+        "          requiredDuringSchedulingIgnoredDuringExecution:",
+        "            nodeSelectorTerms:",
+        "              - matchExpressions:",
+        "                  - key: kubernetes.io/arch",
+        "                    operator: In",
+        "                    values:",
+        "                      - amd64",
+        "                      - arm64",
+        "      volumes:",
+    ]
+    for volume_index in range(12):
+        lines.extend(
+            [
+                f"        - name: config-{volume_index}",
+                "          configMap:",
+                f"            name: demo-config-{volume_index}",
+            ]
+        )
+    lines.extend(
+        [
+            "      containers:",
+            "        - name: primary",
+            "          image: registry.example.com/placeholder:0.0.0",
+            "          indexImage:",
+            "",
+            "",
+            "          releaseImage:",
+            "",
+            "",
+            "          env:",
+        ]
+    )
+    for env_index in range(24):
+        lines.extend(
+            [
+                f"            - name: DEMO_ENV_{env_index}",
+                f"              value: placeholder-{env_index}",
+            ]
+        )
+    lines.extend(
+        [
+            "          volumeMounts:",
+        ]
+    )
+    for mount_index in range(12):
+        lines.extend(
+            [
+                f"            - name: config-{mount_index}",
+                f"              mountPath: /etc/demo/config-{mount_index}",
+                "              readOnly: true",
+            ]
+        )
+    lines.extend(
+        [
+            "        - name: sidecar",
+            "          image: registry.example.com/sidecar:0.0.0",
+            "          indexImage:",
+            "",
+            "",
+            "        - name: metrics",
+            "          image: registry.example.com/metrics:0.0.0",
+            "          indexImage:",
+            "",
+            "",
+        ]
+    )
+    content = "\n".join(lines) + "\n"
+    assert content.count("\n") >= 100, (
+        "fixture must stay large enough to matter for line offsets"
+    )
+    return content
 
 
 def test_parse_args_help() -> None:
@@ -332,7 +507,7 @@ def test_list_konflux_open_mrs_raises_on_project_lookup_error() -> None:
     """Project lookup failures raise ``CheckStepError``."""
     with pytest.raises(tekton.CheckStepError) as exc:
         process_file_updates.list_konflux_open_mrs(
-            "org/up", _mock_gitlab_client(get_error=GitlabError("project not found"))
+            "org/up", "grp", _mock_gitlab_client(get_error=GitlabError("project not found"))
         )
     assert "getting GitLab project" in str(exc.value)
 
@@ -341,7 +516,7 @@ def test_list_konflux_open_mrs_raises_on_list_error() -> None:
     """MR list failures raise ``CheckStepError``."""
     with pytest.raises(tekton.CheckStepError) as exc:
         process_file_updates.list_konflux_open_mrs(
-            "org/up", _mock_gitlab_client(list_error=GitlabError("list failed"))
+            "org/up", "grp", _mock_gitlab_client(list_error=GitlabError("list failed"))
         )
     assert "listing GitLab merge requests" in str(exc.value)
 
@@ -541,9 +716,7 @@ def test_blank_lines_before_yaml(tmp_path: Path) -> None:
     """Leading comment/blank lines are counted before YAML."""
     target = tmp_path / "f.yaml"
     target.write_text("# comment\nkey: v\n", encoding="utf-8")
-    proc = subprocess.CompletedProcess(["awk"], 0, "1\n", "")
-    with mock.patch("subprocess.run", return_value=proc):
-        assert process_file_updates.blank_lines_before_yaml(target) == 1
+    assert process_file_updates.blank_lines_before_yaml(target) == 1
 
 
 def test_blank_lines_before_yaml_returns_zero_on_failure(tmp_path: Path) -> None:
@@ -553,6 +726,22 @@ def test_blank_lines_before_yaml_returns_zero_on_failure(tmp_path: Path) -> None
     proc = subprocess.CompletedProcess(["awk"], 1, "", "err")
     with mock.patch("subprocess.run", return_value=proc):
         assert process_file_updates.blank_lines_before_yaml(target) == 0
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("# comment\nkey: v\n", 1),
+        ("\n\nkey: v\n", 2),
+        ("---\napiVersion: v1\n", 1),
+        ("# Release config\n---\napiVersion: v1\n", 2),
+    ],
+)
+def test_blank_lines_before_yaml_cases(tmp_path: Path, content: str, expected: int) -> None:
+    """Real ``awk`` offsets cover comments, blanks, and ``---`` document starts."""
+    target = tmp_path / "f.yaml"
+    target.write_text(content, encoding="utf-8")
+    assert process_file_updates.blank_lines_before_yaml(target) == expected
 
 
 def test_apply_replacement_block_success(tmp_path: Path) -> None:
@@ -934,12 +1123,27 @@ def test_list_konflux_open_mrs_paginates() -> None:
     """Open MR listing paginates until an empty page."""
     page1_mr = mock.Mock()
     page1_mr.iid = 1
-    items = process_file_updates.list_konflux_open_mrs(
-        "org/up",
-        _mock_gitlab_client(list_pages=[[page1_mr], []]),
-    )
+    client = _mock_gitlab_client(list_pages=[[page1_mr], []])
+    items = process_file_updates.list_konflux_open_mrs("org/up", "grp", client)
     assert len(items) == 1
     assert items[0].iid == 1
+    list_mock = client.projects.get.return_value.mergerequests.list
+    list_mock.assert_has_calls(
+        [
+            mock.call(
+                state="opened",
+                search="[Konflux release] grp",
+                per_page=100,
+                page=1,
+            ),
+            mock.call(
+                state="opened",
+                search="[Konflux release] grp",
+                per_page=100,
+                page=2,
+            ),
+        ]
+    )
 
 
 def test_find_existing_mr_with_same_diff(tmp_path: Path) -> None:
@@ -963,7 +1167,7 @@ def test_find_existing_mr_with_same_diff(tmp_path: Path) -> None:
         mock.patch.object(process_file_updates.vcs_git, "working_tree_diff", return_value=""),
     ):
         info = process_file_updates.find_existing_mr_with_same_diff(
-            "org/up", repo, tmp_path, _mock_gitlab_client()
+            "org/up", "grp", repo, tmp_path, _mock_gitlab_client()
         )
     assert info is not None
     assert "merge_requests/99" in info
@@ -1297,7 +1501,7 @@ def test_find_existing_mr_returns_none_when_diff_differs(tmp_path: Path) -> None
     ):
         assert (
             process_file_updates.find_existing_mr_with_same_diff(
-                "org/up", repo, tmp_path, mock.Mock()
+                "org/up", "grp", repo, tmp_path, mock.Mock()
             )
             is None
         )
@@ -1399,3 +1603,436 @@ def test_main_parse_args_non_int_exit_code() -> None:
         side_effect=SystemExit("usage"),
     ):
         assert process_file_updates.main(["process_file_updates.py"]) == 1
+
+
+def test_apply_replacements_integration_leading_comments_and_document_start(
+    tmp_path: Path,
+) -> None:
+    """Replacements honor leading comments and ``---`` via real ``yq``/``sed``."""
+    _require_yaml_tooling()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    target = repo / "addons" / "my-addon.yaml"
+    target.parent.mkdir(parents=True)
+    target.write_text(
+        "# Konflux addon\n---\nindexImage:\n\n\n",
+        encoding="utf-8",
+    )
+    state = process_file_updates.PathProcessingState()
+    assert (
+        process_file_updates.apply_replacements_for_entry(
+            {
+                "path": "addons/my-addon.yaml",
+                "replacements": [
+                    {"key": ".indexImage", "replacement": "|indexImage:.*|indexImage: Tom|"},
+                ],
+            },
+            target,
+            repo,
+            tmp_path,
+            state,
+        )
+        is None
+    )
+    assert state.replacements_performed == 1
+    assert "indexImage: Tom" in target.read_text(encoding="utf-8")
+
+
+def test_apply_replacements_integration_nested_key_path(tmp_path: Path) -> None:
+    """Nested ``yq`` paths such as ``.spec.containers[0].indexImage`` work end-to-end."""
+    _require_yaml_tooling()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    target = repo / "deploy.yaml"
+    target.write_text(
+        """\
+---
+spec:
+  containers:
+    - name: app
+      indexImage:
+
+
+""",
+        encoding="utf-8",
+    )
+    state = process_file_updates.PathProcessingState()
+    assert (
+        process_file_updates.apply_replacements_for_entry(
+            {
+                "path": "deploy.yaml",
+                "replacements": [
+                    {
+                        "key": ".spec.containers[0].indexImage",
+                        "replacement": (
+                            "|indexImage:.*|indexImage: registry.example.com/demo:1.0|"
+                        ),
+                    },
+                ],
+            },
+            target,
+            repo,
+            tmp_path,
+            state,
+        )
+        is None
+    )
+    assert state.replacements_performed == 1
+    assert "registry.example.com/demo:1.0" in target.read_text(encoding="utf-8")
+
+
+def test_apply_replacements_integration_multiline_index_image_block(
+    tmp_path: Path,
+) -> None:
+    """Multiline ``indexImage`` blocks preserve line count after replacement."""
+    _require_yaml_tooling()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    target = repo / "addon.yaml"
+    target.write_text(
+        """\
+# header
+indexImage:
+
+
+releaseImage:
+
+
+""",
+        encoding="utf-8",
+    )
+    state = process_file_updates.PathProcessingState()
+    assert (
+        process_file_updates.apply_replacements_for_entry(
+            {
+                "path": "addon.yaml",
+                "replacements": [
+                    {
+                        "key": ".indexImage",
+                        "replacement": "|indexImage:.*|indexImage: multi:1.0|",
+                    },
+                ],
+            },
+            target,
+            repo,
+            tmp_path,
+            state,
+        )
+        is None
+    )
+    updated = target.read_text(encoding="utf-8")
+    assert state.replacements_performed == 1
+    assert "indexImage: multi:1.0" in updated
+    assert updated.index("indexImage: multi:1.0") < updated.index("releaseImage:")
+
+
+def test_apply_replacements_integration_multiple_replacements_same_file(
+    tmp_path: Path,
+) -> None:
+    """Multiple replacements in one path entry are applied sequentially."""
+    _require_yaml_tooling()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    target = repo / "addon.yaml"
+    target.write_text(
+        """\
+---
+spec:
+  containers:
+    - name: app
+      indexImage:
+
+
+      releaseImage:
+
+
+""",
+        encoding="utf-8",
+    )
+    state = process_file_updates.PathProcessingState()
+    assert (
+        process_file_updates.apply_replacements_for_entry(
+            {
+                "path": "addon.yaml",
+                "replacements": [
+                    {
+                        "key": ".spec.containers[0].indexImage",
+                        "replacement": "|indexImage:.*|indexImage: first:1.0|",
+                    },
+                    {
+                        "key": ".spec.containers[0].releaseImage",
+                        "replacement": "|releaseImage:.*|releaseImage: second:2.0|",
+                    },
+                ],
+            },
+            target,
+            repo,
+            tmp_path,
+            state,
+        )
+        is None
+    )
+    updated = target.read_text(encoding="utf-8")
+    assert state.replacements_performed == 2
+    assert "indexImage: first:1.0" in updated
+    assert "releaseImage: second:2.0" in updated
+
+
+def test_process_all_paths_integration_multiple_files(tmp_path: Path) -> None:
+    """``process_all_paths`` applies seeds and replacements across multiple files."""
+    _require_yaml_tooling()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    first = repo / "addons" / "one.yaml"
+    second = repo / "addons" / "two.yaml"
+    first.parent.mkdir(parents=True)
+    first.write_text("indexImage:\n\n\n", encoding="utf-8")
+    second.write_text("indexImage:\n\n\n", encoding="utf-8")
+    manifest = tmp_path / "paths.json"
+    manifest.write_text("[]\n", encoding="utf-8")
+    paths = [
+        {
+            "path": "addons/one.yaml",
+            "replacements": [
+                {"key": ".indexImage", "replacement": "|indexImage:.*|indexImage: one:1.0|"},
+            ],
+        },
+        {
+            "path": "addons/two.yaml",
+            "replacements": [
+                {"key": ".indexImage", "replacement": "|indexImage:.*|indexImage: two:2.0|"},
+            ],
+        },
+    ]
+
+    with mock.patch.object(process_file_updates.vcs_git, "index_add_commit") as stage:
+        state, early = process_file_updates.process_all_paths(paths, manifest, repo, tmp_path)
+
+    assert early is None
+    assert state.replacements_performed == 1
+    assert "indexImage: one:1.0" in first.read_text(encoding="utf-8")
+    assert "indexImage: two:2.0" in second.read_text(encoding="utf-8")
+    assert stage.call_count == 2
+    staged_paths = {call.args[1][0] for call in stage.call_args_list}
+    assert staged_paths == {"addons/one.yaml", "addons/two.yaml"}
+
+
+def test_process_all_paths_integration_seed_then_replacement(tmp_path: Path) -> None:
+    """``process_all_paths`` seeds a file then applies replacements with real tooling."""
+    _require_yaml_tooling()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    target = repo / "addons" / "new-addon.yaml"
+    manifest = tmp_path / "paths.json"
+    manifest.write_text("[]\n", encoding="utf-8")
+    paths = [
+        {
+            "path": "addons/new-addon.yaml",
+            "seed": "indexImage:\n\n\nrelatedImages: []\n",
+            "replacements": [
+                {
+                    "key": ".indexImage",
+                    "replacement": "|indexImage:.*|indexImage: seeded:1.0|",
+                },
+            ],
+        }
+    ]
+
+    with (
+        mock.patch.object(process_file_updates.vcs_git, "index_add_commit") as stage,
+        mock.patch.object(
+            process_file_updates.vcs_git,
+            "working_tree_status",
+            return_value="",
+        ),
+    ):
+        state, early = process_file_updates.process_all_paths(paths, manifest, repo, tmp_path)
+
+    assert early is None
+    assert state.replacements_performed == 1
+    updated = target.read_text(encoding="utf-8")
+    assert "indexImage: seeded:1.0" in updated
+    assert "relatedImages: []" in updated
+    assert stage.call_count == 2
+    staged_paths = [call.args[1][0] for call in stage.call_args_list]
+    assert staged_paths == ["addons/new-addon.yaml", "addons/new-addon.yaml"]
+
+
+def test_apply_replacements_integration_complex_deploy_fixture(tmp_path: Path) -> None:
+    """A representative nested deploy manifest accepts several nested replacements."""
+    _require_yaml_tooling()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    target = repo / "data" / "deploy.yaml"
+    target.parent.mkdir(parents=True)
+    target.write_text(_COMPLEX_DEPLOY_YAML, encoding="utf-8")
+    state = process_file_updates.PathProcessingState()
+    assert (
+        process_file_updates.apply_replacements_for_entry(
+            {
+                "path": "data/deploy.yaml",
+                "replacements": [
+                    {
+                        "key": ".spec.template.spec.containers[0].indexImage",
+                        "replacement": "|indexImage:.*|indexImage: primary:1.0|",
+                    },
+                    {
+                        "key": ".spec.template.spec.containers[0].releaseImage",
+                        "replacement": "|releaseImage:.*|releaseImage: primary-rel:1.0|",
+                    },
+                    {
+                        "key": ".spec.template.spec.containers[1].indexImage",
+                        "replacement": "|indexImage:.*|indexImage: sidecar:1.0|",
+                    },
+                ],
+            },
+            target,
+            repo,
+            tmp_path,
+            state,
+        )
+        is None
+    )
+    updated = target.read_text(encoding="utf-8")
+    assert state.replacements_performed == 3
+    assert "indexImage: primary:1.0" in updated
+    assert "releaseImage: primary-rel:1.0" in updated
+    assert "indexImage: sidecar:1.0" in updated
+    assert updated.count("indexImage:") == 2
+
+
+def test_apply_replacements_integration_large_deploy_fixture(tmp_path: Path) -> None:
+    """A 100+ line deploy manifest accepts nested replacements at deep line offsets."""
+    _require_yaml_tooling()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    target = repo / "data" / "deploy.yaml"
+    target.parent.mkdir(parents=True)
+    large_yaml = _large_deploy_yaml()
+    target.write_text(large_yaml, encoding="utf-8")
+    assert large_yaml.count("\n") >= 100
+    state = process_file_updates.PathProcessingState()
+    assert (
+        process_file_updates.apply_replacements_for_entry(
+            {
+                "path": "data/deploy.yaml",
+                "replacements": [
+                    {
+                        "key": ".spec.template.spec.containers[0].indexImage",
+                        "replacement": "|indexImage:.*|indexImage: primary:9.9|",
+                    },
+                    {
+                        "key": ".spec.template.spec.containers[0].releaseImage",
+                        "replacement": "|releaseImage:.*|releaseImage: primary-rel:9.9|",
+                    },
+                    {
+                        "key": ".spec.template.spec.containers[2].indexImage",
+                        "replacement": "|indexImage:.*|indexImage: metrics:9.9|",
+                    },
+                ],
+            },
+            target,
+            repo,
+            tmp_path,
+            state,
+        )
+        is None
+    )
+    updated = target.read_text(encoding="utf-8")
+    assert state.replacements_performed == 3
+    assert "indexImage: primary:9.9" in updated
+    assert "releaseImage: primary-rel:9.9" in updated
+    assert "indexImage: metrics:9.9" in updated
+    assert updated.count("indexImage:") == 3
+    assert len(updated.splitlines()) == len(large_yaml.splitlines())
+
+
+def test_apply_replacement_block_integration_multiline_size_mismatch(
+    tmp_path: Path,
+) -> None:
+    """Real ``sed`` block validation rejects multiline scalar size drift."""
+    _require_yaml_tooling()
+    target = tmp_path / "f.yaml"
+    target.write_text(
+        """\
+# comment
+description: |
+  line one
+  line two
+""",
+        encoding="utf-8",
+    )
+    key = ".description"
+    proc = subprocess.run(
+        ["yq", f"{key} | (line, .)", str(target)],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    blank_offset = process_file_updates.blank_lines_before_yaml(target)
+    found_at = int(proc.stdout.splitlines()[0])
+    value_proc = subprocess.run(
+        ["yq", key, str(target)],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    value_size = len(value_proc.stdout.splitlines())
+    start_block = found_at + blank_offset
+    found_path = tmp_path / "found.txt"
+    found_lines = proc.stdout.splitlines()
+    found_path.write_text(
+        "\n".join(found_lines[1:]) + ("\n" if len(found_lines) > 1 else ""),
+        encoding="utf-8",
+    )
+
+    err, diff_path = process_file_updates.apply_replacement_block(
+        target,
+        start_block,
+        value_size,
+        "|line one|line ONE|",
+        tmp_path,
+    )
+    assert err == "Text block size differs from the original"
+    assert diff_path is not None
+
+
+def test_apply_replacement_block_integration_greedy_replace(tmp_path: Path) -> None:
+    """Real ``sed`` detects greedy replacements that touch multiple lines."""
+    _require_yaml_tooling()
+    target = tmp_path / "f.yaml"
+    target.write_text("values:\n  - alpha\n  - alpha\n", encoding="utf-8")
+    key = ".values[0]"
+    proc = subprocess.run(
+        ["yq", f"{key} | (line, .)", str(target)],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    blank_offset = process_file_updates.blank_lines_before_yaml(target)
+    found_at = int(proc.stdout.splitlines()[0])
+    value_proc = subprocess.run(
+        ["yq", key, str(target)],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    value_size = len(value_proc.stdout.splitlines())
+    start_block = found_at + blank_offset
+    found_path = tmp_path / "found.txt"
+    found_lines = proc.stdout.splitlines()
+    found_path.write_text(
+        "\n".join(found_lines[1:]) + ("\n" if len(found_lines) > 1 else ""),
+        encoding="utf-8",
+    )
+
+    err, diff_path = process_file_updates.apply_replacement_block(
+        target,
+        start_block,
+        value_size,
+        "|alpha|beta|",
+        tmp_path,
+    )
+    assert err is not None
+    assert "Too many lines replaced" in err
+    assert diff_path is not None

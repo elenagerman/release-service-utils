@@ -145,21 +145,26 @@ def gitlab_create_mr(
     )
 
 
-def list_konflux_open_mrs(upstream_repo: str, gitlab_client: gitlab.Gitlab) -> list[Any]:
-    """List open MRs in *upstream_repo* matching ``Konflux release`` (paginated)."""
+def list_konflux_open_mrs(
+    upstream_repo: str,
+    component_group: str,
+    gitlab_client: gitlab.Gitlab,
+) -> list[Any]:
+    """List open MRs scoped to ``[Konflux release] <component_group>`` (paginated)."""
     project_path = vcs_gitlab.gitlab_project_path(upstream_repo)
     try:
         project = gitlab_client.projects.get(project_path)
     except GitlabError as e:
         raise tekton.CheckStepError("getting GitLab project", e) from e
 
+    search = f"[Konflux release] {component_group}"
     page = 1
     found: list[Any] = []
     while True:
         try:
             batch = project.mergerequests.list(
                 state="opened",
-                search="Konflux release",
+                search=search,
                 per_page=100,
                 page=page,
             )
@@ -177,7 +182,7 @@ def blank_lines_before_yaml(target_file: Path) -> int:
     proc = subprocess.run(
         [
             "awk",
-            r"/[[:alpha:]]+/{ if(! match($0, \"^#\")) { print NR-1; exit } }",
+            r'/[[:alpha:]]+/{ if(! match($0, "^#")) { print NR-1; exit } }',
             str(target_file),
         ],
         text=True,
@@ -526,12 +531,13 @@ def get_cached_diff(repo_cwd: Path, temp_dir: Path) -> str:
 
 def find_existing_mr_with_same_diff(
     upstream_repo: str,
+    component_group: str,
     repo_cwd: Path,
     temp_dir: Path,
     gitlab_client: gitlab.Gitlab,
 ) -> str | None:
     """Return result info when an open MR already has the same staged diff."""
-    for mr in list_konflux_open_mrs(upstream_repo, gitlab_client):
+    for mr in list_konflux_open_mrs(upstream_repo, component_group, gitlab_client):
         mr_num = mr.iid
         local_ref = _fetch_merge_request_head(repo_cwd, mr_num)
         final_diff = vcs_git.working_tree_diff(repo_cwd, cached=True, other_ref=local_ref)
@@ -614,7 +620,7 @@ def run_file_updates(
         return "nothing needs change\n", "Success", 0
 
     existing_mr = find_existing_mr_with_same_diff(
-        upstream_repo, repo_cwd, temp_dir, gitlab_client
+        upstream_repo, component_group, repo_cwd, temp_dir, gitlab_client
     )
     if existing_mr is not None:
         return existing_mr, "Success", 0
